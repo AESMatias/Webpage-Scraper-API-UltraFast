@@ -10,6 +10,32 @@ from contextlib import asynccontextmanager
 
 EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}"
 
+PHONE_REGEX = (
+    r'(?:'
+    r'(?:\+|00)[1-9]\d{0,3}(?:[\s.-]?\(?\d{1,4}\)?){1,4}(?:[\s.-]?\d{2,4}){1,3}'
+    r'|'
+    r'\(\d{1,4}\)[\s.-]?\d{3,4}[\s.-]?\d{3,4}'
+    r'|'
+    r'\b(?:\d{2,4}[\s.-]){2,3}\d{3,4}\b'
+    r'|'
+    r'\b\+?56[\s.-]?9[\s.-]?\d{4}[\s.-]?\d{4}\b'
+    r')'
+)
+
+def filter_clean_phone(p: str):
+    p_clean = p.strip()
+    has_plus = p_clean.startswith('+')
+    digits = re.sub(r'\D', '', p_clean)
+    if not (8 <= len(digits) <= 15):
+        return None
+    # Evita numeros con todos los digitos repetidos o junk como 66666666
+    if len(set(digits)) <= 2:
+        return None
+    # Evita fechas de 8 digitos como 20241020
+    if digits.startswith(('199', '200', '201', '202')) and len(digits) == 8:
+        return None
+    return f"+{digits}" if has_plus else digits
+
 # Global variables, we open just one session of HTTPX and Redis.
 redis_client = None
 http_client = None
@@ -127,14 +153,15 @@ async def scrape_endpoint(req: ScrapeRequest):
             raw_phones = set()
             for href in hrefs:
                 if href.lower().startswith("tel:"):
-                    raw_phones.add(href.replace("tel:", ""))
-            found_in_text = re.findall(r'\+?56[\s\-\.]?9[\s\-\.]?\d{4}[\s\-\.]?\d{4}|\+?\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}', text_content)
+                    raw_phones.add(href.replace("tel:", "").split("?")[0].strip())
+            found_in_text = re.findall(PHONE_REGEX, text_content)
             raw_phones.update(found_in_text)
             
             clean_phones = set()
             for p in raw_phones:
-                clean = re.sub(r'[^\d+]', '', p)
-                if 8 <= len(clean) <= 15: clean_phones.add(clean) # Only consider phone numbers with a reasonable length.
+                cleaned = filter_clean_phone(p)
+                if cleaned:
+                    clean_phones.add(cleaned)
             results["phones"] = list(clean_phones)[:30] # Limit to 30 phones to avoid excessive data.
             
             # Social media link extraction from hrefs.
@@ -237,13 +264,14 @@ async def testing_endpoint(req: ScrapeRequest):
             raw_phones = set()
             for href in hrefs:
                 if href.lower().startswith("tel:"):
-                    raw_phones.add(href.replace("tel:", ""))
-            found_in_text = re.findall(r'\+?56[\s\-\.]?9[\s\-\.]?\d{4}[\s\-\.]?\d{4}|\+?\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}', text_content)
+                    raw_phones.add(href.replace("tel:", "").split("?")[0].strip())
+            found_in_text = re.findall(PHONE_REGEX, text_content)
             raw_phones.update(found_in_text)
             clean_phones = set()
             for p in raw_phones:
-                clean = re.sub(r'[^\d+]', '', p)
-                if 8 <= len(clean) <= 15: clean_phones.add(clean)
+                cleaned = filter_clean_phone(p)
+                if cleaned:
+                    clean_phones.add(cleaned)
             results["phones"] = list(clean_phones)[:30]
             
             for h in hrefs:
