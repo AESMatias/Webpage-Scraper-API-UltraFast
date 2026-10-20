@@ -1,17 +1,15 @@
 import asyncio
 import ipaddress
-import json
 import logging
 import os
 import re
 import socket
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
-from playwright.async_api import Browser, Playwright, TimeoutError as PlaywrightTimeoutError, async_playwright
+from fastapi import FastAPI, HTTPException, status
+from playwright.async_api import Browser, Playwright, Route, TimeoutError as PlaywrightTimeoutError, async_playwright
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -20,7 +18,7 @@ from pydantic import BaseModel, Field
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s",
+    format="%(asctime)s [%(levelname)s] [scraper-api]: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("scraper-api")
@@ -28,33 +26,23 @@ logger = logging.getLogger("scraper-api")
 # ---------------------------------------------------------------------------
 # Configuration & Constants
 # ---------------------------------------------------------------------------
+PORT = int(os.getenv("PORT", "8000"))
 MAX_CONCURRENT_SCRAPES = int(os.getenv("MAX_CONCURRENT_SCRAPES", "5"))
-PAGE_TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "20000"))
+PAGE_TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "15000"))
 
 EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}"
 PHONE_REGEX = r"\+?56[\s\-\.]?9[\s\-\.]?\d{4}[\s\-\.]?\d{4}|\+?\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}"
 
-SOCIAL_DOMAINS = [
-    "facebook.com",
-    "instagram.com",
-    "instagr.am",
-    "linkedin.com",
-    "wa.me",
-    "whatsapp.com",
-    "youtube.com",
-    "youtu.be",
-    "twitter.com",
-    "x.com",
-    "tiktok.com",
-    "spotify.com",
+BLOCK_RESOURCE_TYPES = {"image", "media", "font", "stylesheet", "other"}
+BLOCK_DOMAINS = [
+    "google-analytics.com",
+    "googletagmanager.com",
+    "facebook.net",
+    "facebook.com/tr",
+    "doubleclick.net",
+    "hotjar.com",
+    "sentry.io"
 ]
-
-BAD_EXTENSIONS = (
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
-    ".css", ".js", ".ico", ".woff", ".woff2", ".ttf",
-    ".xml", ".json", ".pdf", ".zip", ".tar", ".gz",
-    ".mp4", ".mp3", ".avi", ".mov", ".exe", ".bin"
-)
 
 CHROMIUM_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -98,9 +86,6 @@ def is_ip_forbidden(ip_str: str) -> bool:
         return True
 
 def validate_target_url(raw_input: str) -> str:
-    """
-    Validates, sanitizes, and ensures the target host is not resolving to private/internal IPs.
-    """
     cleaned = raw_input.strip()
     if not cleaned:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Domain cannot be empty")
@@ -118,14 +103,12 @@ def validate_target_url(raw_input: str) -> str:
     if not hostname:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid domain or hostname")
 
-    # Check for localhost / loopback aliases directly
     if hostname.lower() in ("localhost", "127.0.0.1", "::1", "metadata.google.internal"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access to internal hosts is forbidden")
 
-    # DNS Resolution & IP Check
     try:
         addr_info = socket.getaddrinfo(hostname, None)
-        for family, _, _, _, sockaddr in addr_info:
+        for _, _, _, _, sockaddr in addr_info:
             ip_str = sockaddr[0]
             if is_ip_forbidden(ip_str):
                 logger.warning(f"SSRF blocked: hostname '{hostname}' resolved to forbidden IP '{ip_str}'")
@@ -140,101 +123,92 @@ def validate_target_url(raw_input: str) -> str:
     return target_url
 
 # ---------------------------------------------------------------------------
+# Subpage Finder
+# ---------------------------------------------------------------------------
+def find_key_subpages(html_content: str, base_url: str) -> List[str]:
+    subpages: Set[str] = set()
+    keywords = ['contacto', 'contact', 'nosotros', 'ayuda', 'informacion', 'about', 'soporte']
+    hrefs = re.findall(r'href=[\'"]?([^\'" >]+)', html_content)
+    base_netloc = urlparse(base_url).netloc.lower()
+    for href in hrefs:
+        full_url = urljoin(base_url, href)
+        parsed_sub = urlparse(full_url)
+        if parsed_sub.netloc.lower() == base_netloc and parsed_sub.scheme in ("http", "https"):
+            if any(k in href.lower() for k in keywords):
+                subpages.add(full_url)
+    return list(subpages)[:3]
+
+# ---------------------------------------------------------------------------
 # Browser Lifecycle & Self-Healing
 # ---------------------------------------------------------------------------
 async def ensure_browser(app: FastAPI) -> Browser:
     """
-    Returns an active browser instance. If closed/crashed, reinitializes it automatically.
+    Returns an active Chromium browser. Auto-recovers if Chromium was killed or closed.
     """
     browser: Optional[Browser] = getattr(app.state, "browser", None)
     if browser and browser.is_connected():
         return browser
 
     async with browser_lock:
-        # Double check after acquiring lock
         browser = getattr(app.state, "browser", None)
         if browser and browser.is_connected():
             return browser
 
-        logger.warning("Chromium instance is not running or was disconnected. Relaunching...")
+        logger.warning("Chromium instance disconnected or missing. Relaunching Chromium...")
         playwright: Playwright = app.state.playwright
         app.state.browser = await playwright.chromium.launch(
             headless=True,
-            args=CHROMIUM_ARGS,
+            args=CHROMIUM_ARGS
         )
-        logger.info("Chromium launched successfully.")
+        logger.info("Chromium instance successfully launched.")
         return app.state.browser
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Lifespan managing the global Playwright and Browser instances cleanly.
-    """
-    logger.info("Starting up Playwright and Chromium...")
+    logger.info("Initializing Playwright and Chromium...")
     playwright = await async_playwright().start()
     app.state.playwright = playwright
     
     browser = await playwright.chromium.launch(
         headless=True,
-        args=CHROMIUM_ARGS,
+        args=CHROMIUM_ARGS
     )
     app.state.browser = browser
-    logger.info("Playwright and Chromium ready.")
+    logger.info(f"Playwright and Chromium ready. Serving on port {PORT}.")
 
     yield
 
-    # Clean, awaited shutdown sequence
     logger.info("Shutting down Playwright and Chromium...")
     try:
         if hasattr(app.state, "browser") and app.state.browser:
             await app.state.browser.close()
-            logger.info("Browser closed successfully.")
+            logger.info("Browser closed.")
     except Exception as e:
         logger.warning(f"Error closing browser: {e}")
 
     try:
         if hasattr(app.state, "playwright") and app.state.playwright:
-            # FIXED: Coroutine must be awaited!
+            # FIX: Coroutine MUST be awaited
             await app.state.playwright.stop()
-            logger.info("Playwright stopped successfully.")
+            logger.info("Playwright stopped cleanly.")
     except Exception as e:
         logger.warning(f"Error stopping Playwright: {e}")
 
 # ---------------------------------------------------------------------------
-# FastAPI App
+# FastAPI Application
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Webpage Scraper API UltraFast",
-    description="High-speed Playwright-powered scraper for emails, phone numbers, and social media profiles",
+    description="High-speed Playwright-powered scraper for contact info, socials, and subpages",
     version="2.0.0",
     lifespan=lifespan,
 )
 
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
 class ScrapeRequest(BaseModel):
-    domain: str = Field(..., example="example.com", description="Target domain or URL to scrape")
-
-class SocialsResult(BaseModel):
-    instagram: Optional[str] = None
-    facebook: Optional[str] = None
-    whatsapp: Optional[str] = None
-    linkedin: Optional[str] = None
-    twitter: Optional[str] = None
-    youtube: Optional[str] = None
-    spotify: Optional[str] = None
-    tiktok: Optional[str] = None
-
-class ScrapeResponse(BaseModel):
-    target_url: str
-    emails: List[str]
-    phones: List[str]
-    socials: SocialsResult
-    followed_links: List[str]
+    domain: str = Field(..., example="example.com", description="Target domain or full URL")
 
 # ---------------------------------------------------------------------------
-# Health & Status Endpoints
+# Health & Status
 # ---------------------------------------------------------------------------
 @app.get("/health")
 @app.get("/ping")
@@ -248,94 +222,82 @@ async def health_check():
     }
 
 # ---------------------------------------------------------------------------
-# Scraping Route Guard (In-flight SSRF protection)
+# Scrape Endpoint
 # ---------------------------------------------------------------------------
-async def route_guard(route):
-    """
-    Aborts any sub-request or navigation redirecting to private / internal network IPs.
-    """
-    req_url = route.request.url
-    parsed = urlparse(req_url)
-    hostname = parsed.hostname
-
-    if hostname:
-        if hostname.lower() in ("localhost", "127.0.0.1", "::1", "metadata.google.internal"):
-            await route.abort()
-            return
-        try:
-            addr_info = socket.getaddrinfo(hostname, None)
-            for _, _, _, _, sockaddr in addr_info:
-                if is_ip_forbidden(sockaddr[0]):
-                    await route.abort()
-                    return
-        except Exception:
-            pass
-
-    await route.continue_()
-
-# ---------------------------------------------------------------------------
-# Scraping Endpoint
-# ---------------------------------------------------------------------------
-@app.post("/scrape", response_model=ScrapeResponse)
+@app.post("/scrape")
 async def scrape_endpoint(req: ScrapeRequest):
-    # 1. SSRF and Domain Validation
-    target_url = validate_target_url(req.domain)
-
+    url = validate_target_url(req.domain)
+    
     results: Dict = {
-        "target_url": target_url,
+        "target_url": url,
         "emails": [],
         "phones": [],
         "socials": {
             "instagram": None, "facebook": None, "whatsapp": None,
             "linkedin": None, "twitter": None, "youtube": None,
-            "spotify": None, "tiktok": None,
+            "spotify": None, "tiktok": None
         },
         "followed_links": []
     }
 
-    # 2. Acquire Concurrency Permit
     async with scrape_semaphore:
         browser = await ensure_browser(app)
         
-        # 3. Create isolated BrowserContext per request (prevents state leakage and TargetClosedError cascading)
+        # Isolated context per request: prevents TargetClosedError cascade and state leakage
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800},
-            locale="es-ES",
+            device_scale_factor=1,
+            ignore_https_errors=True,
         )
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
         page = await context.new_page()
 
+        # Route handler: Block unnecessary media/trackers and enforce SSRF filter
+        async def route_interceptor(route: Route):
+            req_url = route.request.url
+            res_type = route.request.resource_type
+
+            # 1. Performance filter
+            if res_type in BLOCK_RESOURCE_TYPES or any(d in req_url for d in BLOCK_DOMAINS):
+                await route.abort()
+                return
+
+            # 2. In-flight SSRF filter (block redirect to loopback/private)
+            parsed_req = urlparse(req_url)
+            if parsed_req.hostname:
+                if parsed_req.hostname.lower() in ("localhost", "127.0.0.1", "::1"):
+                    await route.abort()
+                    return
+                try:
+                    addr_info = socket.getaddrinfo(parsed_req.hostname, None)
+                    for _, _, _, _, sockaddr in addr_info:
+                        if is_ip_forbidden(sockaddr[0]):
+                            await route.abort()
+                            return
+                except Exception:
+                    pass
+
+            await route.continue_()
+
+        await page.route("**/*", route_interceptor)
+
         try:
-            # Attach SSRF route guard for redirects & subresources
-            await page.route("**/*", route_guard)
+            # 15s timeout to avoid hoarding RAM
+            logger.info(f"Navigating to {url}...")
+            await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            await page.wait_for_timeout(1500)
 
-            # Navigate to target page
-            logger.info(f"Navigating to {target_url}...")
-            response = await page.goto(
-                target_url,
-                timeout=PAGE_TIMEOUT_MS,
-                wait_until="domcontentloaded",
-            )
-
-            if response and response.status >= 400:
-                logger.warning(f"Target {target_url} returned HTTP {response.status}")
-
-            # Wait briefly for dynamic JS hydration without blocking indefinitely
-            try:
-                await page.wait_for_load_state("networkidle", timeout=3000)
-            except Exception:
-                pass
-
+            text_content = await page.evaluate("document.body ? document.body.innerText : ''")
             html = await page.content()
-            text_content = re.sub(r'<[^>]+>', ' ', html)
 
-            # --- A. Emails Extraction ---
+            # 1. Emails
             emails_raw = list(set(re.findall(EMAIL_REGEX, html) + re.findall(EMAIL_REGEX, text_content)))
             valid_emails = []
             for e in emails_raw:
                 e = e.lower().strip()
-                if any(x in e for x in ["domain.com", "2.3.1", "version", "example.com", "sentry.io", "wixpress", "schema.org"]):
+                if any(x in e for x in ["domain.com", "2.3.1", "version", "sentry.io", "w3.org", "schema.org"]):
                     continue
                 if any(e.endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg')):
                     continue
@@ -343,20 +305,21 @@ async def scrape_endpoint(req: ScrapeRequest):
                     continue
                 valid_emails.append(e)
 
-            # Find mailto links
-            hrefs = await page.eval_on_selector_all("a[href]", "elements => elements.map(el => el.getAttribute('href'))")
-            for href in hrefs:
-                if href and href.lower().startswith("mailto:"):
-                    clean_mailto = href.replace("mailto:", "").split("?")[0].strip().lower()
-                    if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", clean_mailto):
-                        valid_emails.append(clean_mailto)
-            results["emails"] = list(dict.fromkeys(valid_emails))[:30]
+            mailto_links = await page.locator("a[href^='mailto:']").evaluate_all("els => els.map(el => el.href)")
+            for mailto in mailto_links:
+                clean_mailto = mailto.replace("mailto:", "").split("?")[0].strip().lower()
+                if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", clean_mailto):
+                    valid_emails.append(clean_mailto)
 
-            # --- B. Phones Extraction ---
+            results["emails"] = list(dict.fromkeys(valid_emails))
+
+            # 2. Teléfonos
+            hrefs = await page.locator("a").evaluate_all("els => els.map(el => el.href)")
             raw_phones = set()
             for href in hrefs:
                 if href and href.lower().startswith("tel:"):
                     raw_phones.add(href.replace("tel:", ""))
+
             found_in_text = re.findall(PHONE_REGEX, text_content)
             raw_phones.update(found_in_text)
 
@@ -365,9 +328,9 @@ async def scrape_endpoint(req: ScrapeRequest):
                 clean = re.sub(r'[^\d+]', '', p)
                 if 8 <= len(clean) <= 15:
                     clean_phones.add(clean)
-            results["phones"] = list(clean_phones)[:30]
+            results["phones"] = list(clean_phones)
 
-            # --- C. Social Links Extraction ---
+            # 3. Redes sociales
             for h in hrefs:
                 if not h:
                     continue
@@ -389,50 +352,39 @@ async def scrape_endpoint(req: ScrapeRequest):
                 elif "spotify.com" in h_lower and not results["socials"]["spotify"]:
                     results["socials"]["spotify"] = h
 
-            # --- D. Followed Internal Links ---
-            valid_links = set()
-            target_netloc = urlparse(target_url).netloc.lower()
-
-            for href in hrefs:
-                if not href or href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
+            # 4. Subpáginas de contacto / nosotros
+            subpages = find_key_subpages(html, url)
+            for s in subpages:
+                try:
+                    resp = await context.request.get(s, timeout=3000)
+                    if resp.ok:
+                        content = await resp.text()
+                        sub_emails = re.findall(EMAIL_REGEX, content)
+                        valid_sub_emails = [
+                            se.lower().strip() for se in sub_emails
+                            if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", se)
+                            and not any(x in se.lower() for x in ["domain.com", "2.3.1", "version"])
+                        ]
+                        results["emails"].extend(valid_sub_emails)
+                        results["followed_links"].append(s)
+                except Exception as sub_err:
+                    logger.debug(f"Subpage fetch error for {s}: {sub_err}")
                     continue
 
-                full_url = urljoin(target_url, href)
-                parsed_link = urlparse(full_url)
-
-                if parsed_link.scheme not in ('http', 'https'):
-                    continue
-
-                # Filter social media and bad file extensions
-                if any(social in parsed_link.netloc.lower() for social in SOCIAL_DOMAINS):
-                    continue
-                if parsed_link.path.lower().endswith(BAD_EXTENSIONS):
-                    continue
-
-                clean_url = f"{parsed_link.scheme}://{parsed_link.netloc}{parsed_link.path}".rstrip('/')
-                if clean_url and clean_url != target_url.rstrip('/'):
-                    valid_links.add(clean_url)
-
-                if len(valid_links) >= 30:
-                    break
-
-            results["followed_links"] = list(valid_links)[:30]
+            results["emails"] = list(dict.fromkeys(results["emails"]))
 
         except PlaywrightTimeoutError:
-            logger.warning(f"Timeout reached while scraping {target_url} (limit: {PAGE_TIMEOUT_MS}ms)")
-            # Return whatever was partially collected or an informative response
-            results["error"] = "Navigation timeout"
+            logger.warning(f"Timeout (15s) navigating to {url}. Returning partial results.")
         except Exception as e:
-            logger.error(f"Unexpected error scraping {target_url}: {e}", exc_info=True)
-            results["error"] = "Scraping partially failed due to page error"
+            logger.error(f"Error scraping {url}: {e}", exc_info=True)
         finally:
-            # GUARANTEED cleanup: page and context MUST be closed to avoid memory/tab leaks
+            # Cleanup guaranteed
             try:
-                await page.close()
+                await asyncio.wait_for(page.close(), timeout=2.0)
             except Exception:
                 pass
             try:
-                await context.close()
+                await asyncio.wait_for(context.close(), timeout=2.0)
             except Exception:
                 pass
 
@@ -440,5 +392,4 @@ async def scrape_endpoint(req: ScrapeRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # Default port changed from 80 to 8000 to prevent port conflict with Nginx
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)

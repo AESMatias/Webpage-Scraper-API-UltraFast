@@ -9,10 +9,11 @@ services:
     shm_size: '1gb'
     ports:
       - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8000"
     environment:
       - PORT=8000
       - MAX_CONCURRENT_SCRAPES=5
-      - TIMEOUT_MS=20000
+      - TIMEOUT_MS=15000
       - LOG_LEVEL=INFO
     deploy:
       resources:

@@ -7,7 +7,6 @@ set -euo pipefail
 
 WORK_DIR="/root/scraper_api"
 CONTAINER_NAME="scraper-api"
-PORT=8000
 
 echo "=========================================================="
 echo " [1/6] Verificando entorno y permisos en el VPS..."
@@ -67,11 +66,15 @@ echo " [5/6] Verificando salud del contenedor..."
 echo "=========================================================="
 docker ps --filter "name=$CONTAINER_NAME"
 
-echo -n "Comprobando endpoint /health... "
-HEALTH_RESPONSE=$(curl -s -m 5 "http://127.0.0.1:$PORT/health" || echo "FAIL")
-echo "$HEALTH_RESPONSE"
+echo -n "Comprobando endpoint /health en 127.0.0.1:8000... "
+HEALTH_8000=$(curl -s -m 5 "http://127.0.0.1:8000/health" || echo "FAIL")
+echo "$HEALTH_8000"
 
-if [[ "$HEALTH_RESPONSE" != *"ok"* ]]; then
+echo -n "Comprobando endpoint /health en 127.0.0.1:8001 (Nginx upstream)... "
+HEALTH_8001=$(curl -s -m 5 "http://127.0.0.1:8001/health" || echo "FAIL")
+echo "$HEALTH_8001"
+
+if [[ "$HEALTH_8000" != *"ok"* ]]; then
     echo "[ADVERTENCIA] El health check no devolvió status: ok. Logs recientes:"
     docker compose logs --tail=50
     exit 1
@@ -80,7 +83,7 @@ fi
 echo "=========================================================="
 echo " [6/6] Ejecutando scraping de prueba en localhost..."
 echo "=========================================================="
-TEST_RESULT=$(curl -s -X POST "http://127.0.0.1:$PORT/scrape" \
+TEST_RESULT=$(curl -s -X POST "http://127.0.0.1:8000/scrape" \
     -H "Content-Type: application/json" \
     -d '{"domain": "example.com"}')
 
@@ -88,5 +91,5 @@ echo "Resultado del test:"
 echo "$TEST_RESULT" | head -n 30
 
 echo "=========================================================="
-echo " ¡Despliegue completado con éxito en 127.0.0.1:$PORT!"
+echo " ¡Despliegue completado con éxito en 127.0.0.1:8000 y 127.0.0.1:8001!"
 echo "=========================================================="
