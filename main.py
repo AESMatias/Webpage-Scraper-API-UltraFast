@@ -1,395 +1,299 @@
-import asyncio
-import ipaddress
-import logging
-import os
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import re
-import socket
+import asyncio
+import httpx
+import json
+import redis.asyncio as aioredis
+from urllib.parse import urlparse, urljoin
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional, Set
-from urllib.parse import urljoin, urlparse
-
-from fastapi import FastAPI, HTTPException, status
-from playwright.async_api import Browser, Playwright, Route, TimeoutError as PlaywrightTimeoutError, async_playwright
-from pydantic import BaseModel, Field
-
-# ---------------------------------------------------------------------------
-# Logging Configuration
-# ---------------------------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] [scraper-api]: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("scraper-api")
-
-# ---------------------------------------------------------------------------
-# Configuration & Constants
-# ---------------------------------------------------------------------------
-PORT = int(os.getenv("PORT", "8000"))
-MAX_CONCURRENT_SCRAPES = int(os.getenv("MAX_CONCURRENT_SCRAPES", "5"))
-PAGE_TIMEOUT_MS = int(os.getenv("TIMEOUT_MS", "15000"))
 
 EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}"
-PHONE_REGEX = r"\+?56[\s\-\.]?9[\s\-\.]?\d{4}[\s\-\.]?\d{4}|\+?\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}"
 
-BLOCK_RESOURCE_TYPES = {"image", "media", "font", "stylesheet", "other"}
-BLOCK_DOMAINS = [
-    "google-analytics.com",
-    "googletagmanager.com",
-    "facebook.net",
-    "facebook.com/tr",
-    "doubleclick.net",
-    "hotjar.com",
-    "sentry.io"
-]
-
-CHROMIUM_ARGS = [
-    "--disable-blink-features=AutomationControlled",
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--no-first-run",
-    "--no-default-browser-check",
-]
-
-scrape_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCRAPES)
-browser_lock = asyncio.Lock()
-
-# ---------------------------------------------------------------------------
-# SSRF Protection
-# ---------------------------------------------------------------------------
-FORBIDDEN_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),       # IPv4 loopback
-    ipaddress.ip_network("10.0.0.0/8"),        # Private network
-    ipaddress.ip_network("172.16.0.0/12"),     # Private network
-    ipaddress.ip_network("192.168.0.0/16"),    # Private network
-    ipaddress.ip_network("169.254.0.0/16"),    # Link-local / Cloud metadata
-    ipaddress.ip_network("100.64.0.0/10"),     # CGNAT
-    ipaddress.ip_network("0.0.0.0/8"),         # Current network
-    ipaddress.ip_network("224.0.0.0/4"),       # Multicast
-    ipaddress.ip_network("240.0.0.0/4"),       # Reserved
-    ipaddress.ip_network("::1/128"),           # IPv6 loopback
-    ipaddress.ip_network("fc00::/7"),          # IPv6 Unique Local
-    ipaddress.ip_network("fe80::/10"),         # IPv6 Link-local
-]
-
-def is_ip_forbidden(ip_str: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(ip_str)
-        for net in FORBIDDEN_NETWORKS:
-            if ip in net:
-                return True
-        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
-    except ValueError:
-        return True
-
-def validate_target_url(raw_input: str) -> str:
-    cleaned = raw_input.strip()
-    if not cleaned:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Domain cannot be empty")
-
-    if not cleaned.startswith(("http://", "https://")):
-        target_url = f"https://{cleaned}"
-    else:
-        target_url = cleaned
-
-    parsed = urlparse(target_url)
-    if parsed.scheme not in ("http", "https"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported scheme: {parsed.scheme}")
-
-    hostname = parsed.hostname
-    if not hostname:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid domain or hostname")
-
-    if hostname.lower() in ("localhost", "127.0.0.1", "::1", "metadata.google.internal"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access to internal hosts is forbidden")
-
-    try:
-        addr_info = socket.getaddrinfo(hostname, None)
-        for _, _, _, _, sockaddr in addr_info:
-            ip_str = sockaddr[0]
-            if is_ip_forbidden(ip_str):
-                logger.warning(f"SSRF blocked: hostname '{hostname}' resolved to forbidden IP '{ip_str}'")
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access to private or restricted network addresses is forbidden"
-                )
-    except socket.gaierror as e:
-        logger.info(f"DNS resolution failed for '{hostname}': {e}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not resolve domain: {hostname}")
-
-    return target_url
-
-# ---------------------------------------------------------------------------
-# Subpage Finder
-# ---------------------------------------------------------------------------
-def find_key_subpages(html_content: str, base_url: str) -> List[str]:
-    subpages: Set[str] = set()
-    keywords = ['contacto', 'contact', 'nosotros', 'ayuda', 'informacion', 'about', 'soporte']
-    hrefs = re.findall(r'href=[\'"]?([^\'" >]+)', html_content)
-    base_netloc = urlparse(base_url).netloc.lower()
-    for href in hrefs:
-        full_url = urljoin(base_url, href)
-        parsed_sub = urlparse(full_url)
-        if parsed_sub.netloc.lower() == base_netloc and parsed_sub.scheme in ("http", "https"):
-            if any(k in href.lower() for k in keywords):
-                subpages.add(full_url)
-    return list(subpages)[:3]
-
-# ---------------------------------------------------------------------------
-# Browser Lifecycle & Self-Healing
-# ---------------------------------------------------------------------------
-async def ensure_browser(app: FastAPI) -> Browser:
-    """
-    Returns an active Chromium browser. Auto-recovers if Chromium was killed or closed.
-    """
-    browser: Optional[Browser] = getattr(app.state, "browser", None)
-    if browser and browser.is_connected():
-        return browser
-
-    async with browser_lock:
-        browser = getattr(app.state, "browser", None)
-        if browser and browser.is_connected():
-            return browser
-
-        logger.warning("Chromium instance disconnected or missing. Relaunching Chromium...")
-        playwright: Playwright = app.state.playwright
-        app.state.browser = await playwright.chromium.launch(
-            headless=True,
-            args=CHROMIUM_ARGS
-        )
-        logger.info("Chromium instance successfully launched.")
-        return app.state.browser
+# Global variables, we open just one session of HTTPX and Redis.
+redis_client = None
+http_client = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Initializing Playwright and Chromium...")
-    playwright = await async_playwright().start()
-    app.state.playwright = playwright
+    global redis_client, http_client
     
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=CHROMIUM_ARGS
+    redis_client = aioredis.from_url(
+        "redis://localhost:6379", 
+        decode_responses=True,
+        max_connections=10000 # We allow up to 10k connections to Redis, because we will have many concurrent requests
     )
-    app.state.browser = browser
-    logger.info(f"Playwright and Chromium ready. Serving on port {PORT}.")
+    
+    # Initialize HTTPX Global Unlimited (Prevents "Too many open files").
+    unlimited_httpx_limit = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+    http_client = httpx.AsyncClient(verify=False, timeout=8.0, follow_redirects=True, limits=unlimited_httpx_limit)
 
+    # Forward port 8000 to 8001 so both ports work
+    async def forward_8000(reader, writer):
+        try:
+            r, w = await asyncio.open_connection('127.0.0.1', 8001)
+            async def pipe(src, dst):
+                while True:
+                    data = await src.read(4096)
+                    if not data:
+                        break
+                    dst.write(data)
+                    await dst.drain()
+            await asyncio.gather(pipe(reader, w), pipe(r, writer), return_exceptions=True)
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    server_8000 = None
+    try:
+        server_8000 = await asyncio.start_server(forward_8000, '0.0.0.0', 8000)
+    except Exception:
+        pass
+    
     yield
+    
+    if server_8000:
+        server_8000.close()
+        await server_8000.wait_closed()
 
-    logger.info("Shutting down Playwright and Chromium...")
-    try:
-        if hasattr(app.state, "browser") and app.state.browser:
-            await app.state.browser.close()
-            logger.info("Browser closed.")
-    except Exception as e:
-        logger.warning(f"Error closing browser: {e}")
+    # When the app is shutting down, we close the Redis and HTTPX clients.
+    await redis_client.close()
+    await http_client.aclose()
 
-    try:
-        if hasattr(app.state, "playwright") and app.state.playwright:
-            # FIX: Coroutine MUST be awaited
-            await app.state.playwright.stop()
-            logger.info("Playwright stopped cleanly.")
-    except Exception as e:
-        logger.warning(f"Error stopping Playwright: {e}")
+app = FastAPI(lifespan=lifespan)
 
-# ---------------------------------------------------------------------------
-# FastAPI Application
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="Webpage Scraper API UltraFast",
-    description="High-speed Playwright-powered scraper for contact info, socials, and subpages",
-    version="2.0.0",
-    lifespan=lifespan,
-)
-
-class ScrapeRequest(BaseModel):
-    domain: str = Field(..., example="example.com", description="Target domain or full URL")
-
-# ---------------------------------------------------------------------------
-# Health & Status
-# ---------------------------------------------------------------------------
 @app.get("/health")
 @app.get("/ping")
 async def health_check():
-    browser: Optional[Browser] = getattr(app.state, "browser", None)
-    is_connected = bool(browser and browser.is_connected())
-    return {
-        "status": "ok" if is_connected else "degraded",
-        "browser_connected": is_connected,
-        "max_concurrent_workers": MAX_CONCURRENT_SCRAPES,
-    }
+    return {"status": "ok"}
 
-# ---------------------------------------------------------------------------
-# Scrape Endpoint
-# ---------------------------------------------------------------------------
+class ScrapeRequest(BaseModel):
+    domain: str
+
 @app.post("/scrape")
 async def scrape_endpoint(req: ScrapeRequest):
-    url = validate_target_url(req.domain)
+    url = req.domain if req.domain.startswith("http") or \
+        req.domain.startswith("www") or req.domain.startswith("https") \
+            else f"https://{req.domain}"
     
-    results: Dict = {
-        "target_url": url,
-        "emails": [],
-        "phones": [],
-        "socials": {
-            "instagram": None, "facebook": None, "whatsapp": None,
-            "linkedin": None, "twitter": None, "youtube": None,
-            "spotify": None, "tiktok": None
-        },
-        "followed_links": []
+    cache_key = f"scrape:{url}"
+    try:
+        cached_data = await redis_client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data)
+    except Exception:
+        pass
+
+    results = {
+        "target_url": url, "emails": [], "phones": [],
+        "socials": {"instagram": None, "facebook": None, "whatsapp": None, "linkedin": None, "twitter": None, "youtube": None, "spotify": None, "tiktok": None},
+        "followed_links": []  
     }
 
-    async with scrape_semaphore:
-        browser = await ensure_browser(app)
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
+        }
         
-        # Isolated context per request: prevents TargetClosedError cascade and state leakage
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-            device_scale_factor=1,
-            ignore_https_errors=True,
-        )
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        resp = await http_client.get(url, headers=headers) # Use the global http_client instead of creating a new one for each request
+        
+        if resp.status_code == 200:
+            html = resp.text
+            text_content = re.sub(r'<[^>]+>', ' ', html) # Remove HTML tags to extract text content.
+            
+            # Email extraction using regex from both HTML and text content.
+            emails_raw = list(set(re.findall(EMAIL_REGEX, html) + re.findall(EMAIL_REGEX, text_content)))
+            valid_emails = []
+            
+            for e in emails_raw:
+                e = e.lower().strip()
+                if any(x in e for x in ["domain.com", "2.3.1", "version", "example.com", "sentry.io", "wixpress"]): continue
+                if any(e.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']): continue
+                if not re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", e): continue
+                valid_emails.append(e)
+            
+            hrefs = re.findall(r'href=[\'"]?([^\'" >]+)', html) # Extract hrefs from HTML to find mailto links and other useful links.
+            for href in hrefs:
+                if href.lower().startswith("mailto:"):
+                    clean_mailto = href.replace("mailto:", "").split("?")[0].strip().lower()
+                    if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", clean_mailto):
+                        valid_emails.append(clean_mailto)
+            results["emails"] = list(set(valid_emails))[:30] # Limit to 30 emails to avoid excessive data.
+            
+            # Phone extraction using regex from both hrefs and text content.
+            raw_phones = set()
+            for href in hrefs:
+                if href.lower().startswith("tel:"):
+                    raw_phones.add(href.replace("tel:", ""))
+            found_in_text = re.findall(r'\+?56[\s\-\.]?9[\s\-\.]?\d{4}[\s\-\.]?\d{4}|\+?\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}', text_content)
+            raw_phones.update(found_in_text)
+            
+            clean_phones = set()
+            for p in raw_phones:
+                clean = re.sub(r'[^\d+]', '', p)
+                if 8 <= len(clean) <= 15: clean_phones.add(clean) # Only consider phone numbers with a reasonable length.
+            results["phones"] = list(clean_phones)[:30] # Limit to 30 phones to avoid excessive data.
+            
+            # Social media link extraction from hrefs.
+            for h in hrefs:
+                if not h: continue
+                h_lower = h.lower()
+                if "facebook.com" in h_lower and not results["socials"]["facebook"]: results["socials"]["facebook"] = h
+                elif ("instagram.com" in h_lower or "instagr.am" in h_lower) and not results["socials"]["instagram"]: results["socials"]["instagram"] = h
+                elif "linkedin.com" in h_lower and not results["socials"]["linkedin"]: results["socials"]["linkedin"] = h
+                elif "wa.me" in h_lower or "api.whatsapp.com" in h_lower and not results["socials"]["whatsapp"]: results["socials"]["whatsapp"] = h
+                elif ("youtube.com" in h_lower or "youtu.be" in h_lower) and not results["socials"]["youtube"]: results["socials"]["youtube"] = h
+                elif ("twitter.com" in h_lower or "x.com" in h_lower) and not results["socials"]["twitter"]: results["socials"]["twitter"] = h
+                elif "tiktok.com" in h_lower and not results["socials"]["tiktok"]: results["socials"]["tiktok"] = h
+                elif "spotify.com" in h_lower and not results["socials"]["spotify"]: results["socials"]["spotify"] = h
 
-        page = await context.new_page()
+            # Intelligent filtering of the followed links to avoid social media, bad extensions, and other unwanted links.
+            valid_links = set()
+            social_domains = ["facebook.com", "instagram.com", "instagr.am", "linkedin.com", "wa.me", "whatsapp.com", "youtube.com", "youtu.be", "twitter.com", "x.com", "tiktok.com", "spotify.com"]
+            bad_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.css', '.js', '.ico', '.woff', '.woff2', '.ttf', '.xml', '.json', '.pdf']
 
-        # Route handler: Block unnecessary media/trackers and enforce SSRF filter
-        async def route_interceptor(route: Route):
-            req_url = route.request.url
-            res_type = route.request.resource_type
+            for href in hrefs:
+                if not href or href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:') or href.startswith('tel:'):
+                    continue
+                
+                full_url = urljoin(url, href)
+                parsed_url = urlparse(full_url)
+                
+                if parsed_url.scheme not in ['http', 'https']:
+                    continue # Ignore data://, file://, ftp://, etc. Only allow http and https.
+                
+                if any(social in parsed_url.netloc.lower() for social in social_domains):
+                    continue
+                    
+                path_lower = parsed_url.path.lower()
+                if any(path_lower.endswith(ext) for ext in bad_extensions):
+                    continue
+                    
+                clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}".rstrip('/')
+                
+                if clean_url and clean_url != url.rstrip('/'):
+                    valid_links.add(clean_url)
+                    
+                if len(valid_links) >= 30: # Limit to 30 links to avoid excessive data.
+                    break
 
-            # 1. Performance filter
-            if res_type in BLOCK_RESOURCE_TYPES or any(d in req_url for d in BLOCK_DOMAINS):
-                await route.abort()
-                return
+            results["followed_links"] = list(valid_links)[:30] # Limit to 30 links to avoid excessive data.
 
-            # 2. In-flight SSRF filter (block redirect to loopback/private)
-            parsed_req = urlparse(req_url)
-            if parsed_req.hostname:
-                if parsed_req.hostname.lower() in ("localhost", "127.0.0.1", "::1"):
-                    await route.abort()
-                    return
-                try:
-                    addr_info = socket.getaddrinfo(parsed_req.hostname, None)
-                    for _, _, _, _, sockaddr in addr_info:
-                        if is_ip_forbidden(sockaddr[0]):
-                            await route.abort()
-                            return
-                except Exception:
-                    pass
+    except Exception:
+        pass
 
-            await route.continue_()
+    try:
+        await redis_client.set(cache_key, json.dumps(results), ex=3600)
+    except Exception:
+        pass
 
-        await page.route("**/*", route_interceptor)
+    return results
 
-        try:
-            # 15s timeout to avoid hoarding RAM
-            logger.info(f"Navigating to {url}...")
-            await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-            await page.wait_for_timeout(1500)
+@app.post("/testing")
+async def testing_endpoint(req: ScrapeRequest):
+    url = req.domain if req.domain.startswith("http") else f"https://{req.domain}"
+    
+    # ❌ Redis caching is removed here, to force every request to process RegEx and saturate the CPU for testing purposes.
 
-            text_content = await page.evaluate("document.body ? document.body.innerText : ''")
-            html = await page.content()
+    results = {
+        "target_url": url, "emails": [], "phones": [],
+        "socials": {"instagram": None, "facebook": None, "whatsapp": None, "linkedin": None, "twitter": None, "youtube": None, "spotify": None, "tiktok": None},
+        "followed_links": []  
+    }
 
-            # 1. Emails
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
+        }
+        
+        resp = await http_client.get(url, headers=headers)
+        
+        if resp.status_code == 200:
+            html = resp.text
+            text_content = re.sub(r'<[^>]+>', ' ', html)
+            
             emails_raw = list(set(re.findall(EMAIL_REGEX, html) + re.findall(EMAIL_REGEX, text_content)))
             valid_emails = []
             for e in emails_raw:
                 e = e.lower().strip()
-                if any(x in e for x in ["domain.com", "2.3.1", "version", "sentry.io", "w3.org", "schema.org"]):
-                    continue
-                if any(e.endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg')):
-                    continue
-                if not re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", e):
-                    continue
+                if any(x in e for x in ["domain.com", "2.3.1", "version", "example.com", "sentry.io", "wixpress"]): continue
+                if any(e.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']): continue
+                if not re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", e): continue
                 valid_emails.append(e)
-
-            mailto_links = await page.locator("a[href^='mailto:']").evaluate_all("els => els.map(el => el.href)")
-            for mailto in mailto_links:
-                clean_mailto = mailto.replace("mailto:", "").split("?")[0].strip().lower()
-                if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", clean_mailto):
-                    valid_emails.append(clean_mailto)
-
-            results["emails"] = list(dict.fromkeys(valid_emails))
-
-            # 2. Teléfonos
-            hrefs = await page.locator("a").evaluate_all("els => els.map(el => el.href)")
+            
+            hrefs = re.findall(r'href=[\'"]?([^\'" >]+)', html)
+            for href in hrefs:
+                if href.lower().startswith("mailto:"):
+                    clean_mailto = href.replace("mailto:", "").split("?")[0].strip().lower()
+                    if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", clean_mailto):
+                        valid_emails.append(clean_mailto)
+            results["emails"] = list(set(valid_emails))[:30]
+            
             raw_phones = set()
             for href in hrefs:
-                if href and href.lower().startswith("tel:"):
+                if href.lower().startswith("tel:"):
                     raw_phones.add(href.replace("tel:", ""))
-
-            found_in_text = re.findall(PHONE_REGEX, text_content)
+            found_in_text = re.findall(r'\+?56[\s\-\.]?9[\s\-\.]?\d{4}[\s\-\.]?\d{4}|\+?\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}', text_content)
             raw_phones.update(found_in_text)
-
             clean_phones = set()
             for p in raw_phones:
                 clean = re.sub(r'[^\d+]', '', p)
-                if 8 <= len(clean) <= 15:
-                    clean_phones.add(clean)
-            results["phones"] = list(clean_phones)
-
-            # 3. Redes sociales
+                if 8 <= len(clean) <= 15: clean_phones.add(clean)
+            results["phones"] = list(clean_phones)[:30]
+            
             for h in hrefs:
-                if not h:
-                    continue
+                if not h: continue
                 h_lower = h.lower()
-                if "facebook.com" in h_lower and not results["socials"]["facebook"]:
-                    results["socials"]["facebook"] = h
-                elif ("instagram.com" in h_lower or "instagr.am" in h_lower) and not results["socials"]["instagram"]:
-                    results["socials"]["instagram"] = h
-                elif "linkedin.com" in h_lower and not results["socials"]["linkedin"]:
-                    results["socials"]["linkedin"] = h
-                elif ("wa.me" in h_lower or "api.whatsapp.com" in h_lower) and not results["socials"]["whatsapp"]:
-                    results["socials"]["whatsapp"] = h
-                elif ("youtube.com" in h_lower or "youtu.be" in h_lower) and not results["socials"]["youtube"]:
-                    results["socials"]["youtube"] = h
-                elif ("twitter.com" in h_lower or "x.com" in h_lower) and not results["socials"]["twitter"]:
-                    results["socials"]["twitter"] = h
-                elif "tiktok.com" in h_lower and not results["socials"]["tiktok"]:
-                    results["socials"]["tiktok"] = h
-                elif "spotify.com" in h_lower and not results["socials"]["spotify"]:
-                    results["socials"]["spotify"] = h
+                if "facebook.com" in h_lower and not results["socials"]["facebook"]: results["socials"]["facebook"] = h
+                elif ("instagram.com" in h_lower or "instagr.am" in h_lower) and not results["socials"]["instagram"]: results["socials"]["instagram"] = h
+                elif "linkedin.com" in h_lower and not results["socials"]["linkedin"]: results["socials"]["linkedin"] = h
+                elif "wa.me" in h_lower or "api.whatsapp.com" in h_lower and not results["socials"]["whatsapp"]: results["socials"]["whatsapp"] = h
+                elif ("youtube.com" in h_lower or "youtu.be" in h_lower) and not results["socials"]["youtube"]: results["socials"]["youtube"] = h
+                elif ("twitter.com" in h_lower or "x.com" in h_lower) and not results["socials"]["twitter"]: results["socials"]["twitter"] = h
+                elif "tiktok.com" in h_lower and not results["socials"]["tiktok"]: results["socials"]["tiktok"] = h
+                elif "spotify.com" in h_lower and not results["socials"]["spotify"]: results["socials"]["spotify"] = h
 
-            # 4. Subpáginas de contacto / nosotros
-            subpages = find_key_subpages(html, url)
-            for s in subpages:
-                try:
-                    resp = await context.request.get(s, timeout=3000)
-                    if resp.ok:
-                        content = await resp.text()
-                        sub_emails = re.findall(EMAIL_REGEX, content)
-                        valid_sub_emails = [
-                            se.lower().strip() for se in sub_emails
-                            if re.match(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", se)
-                            and not any(x in se.lower() for x in ["domain.com", "2.3.1", "version"])
-                        ]
-                        results["emails"].extend(valid_sub_emails)
-                        results["followed_links"].append(s)
-                except Exception as sub_err:
-                    logger.debug(f"Subpage fetch error for {s}: {sub_err}")
+            valid_links = set()
+            social_domains = ["facebook.com", "instagram.com", "instagr.am", "linkedin.com", "wa.me", "whatsapp.com", "youtube.com", "youtu.be", "twitter.com", "x.com", "tiktok.com", "spotify.com"]
+            bad_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.css', '.js', '.ico', '.woff', '.woff2', '.ttf', '.xml', '.json', '.pdf']
+
+            for href in hrefs:
+                if not href or href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:') or href.startswith('tel:'):
                     continue
+                
+                full_url = urljoin(url, href)
+                parsed_url = urlparse(full_url)
+                
+                if parsed_url.scheme not in ['http', 'https']:
+                    continue
+                
+                if any(social in parsed_url.netloc.lower() for social in social_domains):
+                    continue
+                    
+                path_lower = parsed_url.path.lower()
+                if any(path_lower.endswith(ext) for ext in bad_extensions):
+                    continue
+                    
+                clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}".rstrip('/')
+                
+                if clean_url and clean_url != url.rstrip('/'):
+                    valid_links.add(clean_url)
+                    
+                if len(valid_links) >= 30:
+                    break
 
-            results["emails"] = list(dict.fromkeys(results["emails"]))
+            results["followed_links"] = list(valid_links)[:30]
 
-        except PlaywrightTimeoutError:
-            logger.warning(f"Timeout (15s) navigating to {url}. Returning partial results.")
-        except Exception as e:
-            logger.error(f"Error scraping {url}: {e}", exc_info=True)
-        finally:
-            # Cleanup guaranteed
-            try:
-                await asyncio.wait_for(page.close(), timeout=2.0)
-            except Exception:
-                pass
-            try:
-                await asyncio.wait_for(context.close(), timeout=2.0)
-            except Exception:
-                pass
+    except Exception:
+        pass
 
     return results
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001)
