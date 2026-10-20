@@ -10,31 +10,42 @@ from contextlib import asynccontextmanager
 
 EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}"
 
-PHONE_REGEX = (
+PHONE_REGEX = re.compile(
     r'(?:'
-    r'(?:\+|00)[1-9]\d{0,3}(?:[\s.-]?\(?\d{1,4}\)?){1,4}(?:[\s.-]?\d{2,4}){1,3}'
+    r'(?:\+|00)[1-9]\d{0,2}(?:[\s.-]?\(?\d{1,4}\)?){1,4}(?:[\s.-]?\d{2,4}){1,3}'
     r'|'
     r'\(\d{1,4}\)[\s.-]?\d{3,4}[\s.-]?\d{3,4}'
     r'|'
-    r'\b(?:\d{2,4}[\s.-]){2,3}\d{3,4}\b'
+    r'\b(?:\d{1,4}[.-]){2,3}\d{3,4}\b'
     r'|'
-    r'\b\+?56[\s.-]?9[\s.-]?\d{4}[\s.-]?\d{4}\b'
-    r')'
+    r'\b56[\s.-]?[2-9][\s.-]?\d{4}[\s.-]?\d{4}\b'
+    r'|'
+    r'(?:tel[eé]fono|tel|fono|phone|celular|m[oó]vil|whatsapp|call)[\s.:#]+(\+?[0-9\s().-]{8,20})'
+    r')',
+    re.IGNORECASE
 )
 
-def filter_clean_phone(p: str):
-    p_clean = p.strip()
-    has_plus = p_clean.startswith('+')
-    digits = re.sub(r'\D', '', p_clean)
-    if not (8 <= len(digits) <= 15):
-        return None
-    # Evita numeros con todos los digitos repetidos o junk como 66666666
-    if len(set(digits)) <= 2:
-        return None
-    # Evita fechas de 8 digitos como 20241020
-    if digits.startswith(('199', '200', '201', '202')) and len(digits) == 8:
-        return None
-    return f"+{digits}" if has_plus else digits
+def extract_valid_phones(text_content: str, hrefs: list) -> list:
+    phones = set()
+    for href in hrefs:
+        if href.lower().startswith("tel:"):
+            clean_tel = href.replace("tel:", "").split("?")[0].strip()
+            digits = re.sub(r'\D', '', clean_tel)
+            if 8 <= len(digits) <= 15 and len(set(digits)) > 2:
+                phones.add(f"+{digits}" if clean_tel.startswith("+") else digits)
+
+    for m in PHONE_REGEX.finditer(text_content):
+        val = m.group(1) if m.group(1) else m.group(0)
+        digits = re.sub(r'\D', '', val)
+        if not (8 <= len(digits) <= 15):
+            continue
+        if len(set(digits)) <= 2:
+            continue
+        if digits.startswith(('199', '200', '201', '202')) and len(digits) == 8:
+            continue
+        has_plus = val.strip().startswith('+')
+        phones.add(f"+{digits}" if has_plus else digits)
+    return list(phones)[:30]
 
 # Global variables, we open just one session of HTTPX and Redis.
 redis_client = None
@@ -150,19 +161,7 @@ async def scrape_endpoint(req: ScrapeRequest):
             results["emails"] = list(set(valid_emails))[:30] # Limit to 30 emails to avoid excessive data.
             
             # Phone extraction using regex from both hrefs and text content.
-            raw_phones = set()
-            for href in hrefs:
-                if href.lower().startswith("tel:"):
-                    raw_phones.add(href.replace("tel:", "").split("?")[0].strip())
-            found_in_text = re.findall(PHONE_REGEX, text_content)
-            raw_phones.update(found_in_text)
-            
-            clean_phones = set()
-            for p in raw_phones:
-                cleaned = filter_clean_phone(p)
-                if cleaned:
-                    clean_phones.add(cleaned)
-            results["phones"] = list(clean_phones)[:30] # Limit to 30 phones to avoid excessive data.
+            results["phones"] = extract_valid_phones(text_content, hrefs)
             
             # Social media link extraction from hrefs.
             for h in hrefs:
@@ -261,18 +260,7 @@ async def testing_endpoint(req: ScrapeRequest):
                         valid_emails.append(clean_mailto)
             results["emails"] = list(set(valid_emails))[:30]
             
-            raw_phones = set()
-            for href in hrefs:
-                if href.lower().startswith("tel:"):
-                    raw_phones.add(href.replace("tel:", "").split("?")[0].strip())
-            found_in_text = re.findall(PHONE_REGEX, text_content)
-            raw_phones.update(found_in_text)
-            clean_phones = set()
-            for p in raw_phones:
-                cleaned = filter_clean_phone(p)
-                if cleaned:
-                    clean_phones.add(cleaned)
-            results["phones"] = list(clean_phones)[:30]
+            results["phones"] = extract_valid_phones(text_content, hrefs)
             
             for h in hrefs:
                 if not h: continue
